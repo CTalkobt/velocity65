@@ -1,0 +1,144 @@
+; kernal.s45 — a KERNAL call with the ROM at $C000 mapped in only for it
+;
+; The game has the RAM at $C000-$CFFF (its BSS and its stack are there:
+; ln45 --ram-top), so the C65 ROM that is normally mapped there ($D030 bit
+; 5) is mapped out while it runs, with interrupts off. A KERNAL routine
+; needs that ROM, its own page-1 stack and base page 0: kcall switches to
+; them (as the library's __rom_call does, lib/stdlib_asm/rom_call.s45),
+; maps the ROM in with interrupts on for the routine, and back out before
+; it returns on the program's stack.
+;
+;   kc_target  the routine (SETBNK $FF6B, SETNAM $FFBD, SETLFS $FFBA, LOAD
+;              $FFD5, SAVE $FFD8, CHROUT $FFD2...)
+;   kc_a, kc_x, kc_y  in, and out
+;   kc_c       out: the carry (a LOAD's or SAVE's error)
+;   kc_ptr     not 0: put in $FB/$FC of page 0 first (SAVE's start pointer;
+;              A = $FB), their bytes put back after
+
+.cpu _45gs02
+.segmentOrder code, data, bss
+
+.global _kcall
+.global _kc_a
+.global _kc_x
+.global _kc_y
+.global _kc_c
+.global _kc_target
+.global _kc_ptr
+.global __rom_call
+.extern __saved_spl, __saved_sph, __bp_prog, ___cbm_target
+
+;   The ROM is mapped out before anything else runs: this file's "init"
+;   piece comes first in the program (ln45 puts the init chunks first, the
+;   program's objects before the library's), before crt0's, which it falls
+;   through into. The startup code's stack is above $C000 too.
+
+.segment "init"
+    sei
+    lda $D030
+    and #$DF
+    sta $D030
+    ; (on into crt0)
+
+;   Its state is in low RAM ($1F00, past game.c's save record): the
+;   program's own data can reach $C000, which reads as ROM while the
+;   routine's registers are loaded
+KSTATE     = $1F00
+_kc_a      = KSTATE
+_kc_x      = KSTATE + 1
+_kc_y      = KSTATE + 2
+_kc_c      = KSTATE + 3
+_kc_target = KSTATE + 4
+_kc_ptr    = KSTATE + 6
+k_spl      = KSTATE + 8
+k_sph      = KSTATE + 9
+k_keep     = KSTATE + 10
+
+.code
+
+proc _kcall
+    lda _kc_target
+    sta @jsr + 1
+    lda _kc_target + 1
+    sta @jsr + 2
+    sei
+    tsx                     ; the program's stack pointer
+    stx k_spl
+    tsy
+    sty k_sph
+    see                     ; the ROM's page-1 stack (8-bit), base page 0
+    ldx __saved_spl + 1
+    txs
+    ldy __saved_sph + 1
+    tys
+    lda #0
+    tab
+    lda $FB                 ; SAVE's pointer, if one is given
+    sta k_keep
+    lda $FC
+    sta k_keep + 1
+    lda _kc_ptr
+    ora _kc_ptr + 1
+    beq @noptr
+    lda _kc_ptr
+    sta $FB
+    lda _kc_ptr + 1
+    sta $FC
+@noptr:
+    lda $D030               ; the ROM at $C000 in
+    ora #$20
+    sta $D030
+    lda _kc_a
+    ldx _kc_x
+    ldy _kc_y
+    cli
+@jsr:
+    jsr $FFFF               ; (patched above)
+    php
+    sei
+    sta _kc_a
+    stx _kc_x
+    sty _kc_y
+    pla
+    and #1
+    sta _kc_c
+    lda $D030               ; and out again
+    and #$DF
+    sta $D030
+    lda k_keep
+    sta $FB
+    lda k_keep + 1
+    sta $FC
+    cle                     ; back to the program's 16-bit stack
+    ldy k_sph
+    tys
+    ldx k_spl
+    txs
+    ldz #0
+    jmp __bp_prog           ; the program's base page; returns to the caller
+endproc
+
+; __rom_call — the library's KERNAL call, as the code overlays' loader
+; (crt0's __ovl_init, before main) makes it: the routine at ___cbm_target
+; with A, X, Y; A, X, Y and C back. This one is the program's own (the
+; library's is not linked): through kcall, so the ROM at $C000 is mapped in
+; for it while the program's stack (above $C000) is out of the way
+proc __rom_call
+    sta _kc_a
+    stx _kc_x
+    sty _kc_y
+    lda ___cbm_target
+    sta _kc_target
+    lda ___cbm_target + 1
+    sta _kc_target + 1
+    lda #0
+    sta _kc_ptr
+    sta _kc_ptr + 1
+    jsr _kcall
+    lda _kc_c
+    lsr                     ; C: the routine's
+    lda _kc_a
+    ldx _kc_x
+    ldy _kc_y
+    rts
+endproc

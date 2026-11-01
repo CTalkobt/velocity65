@@ -1,0 +1,3332 @@
+; render.s45 — the road, the sky and the sprites, drawn by DMA
+;
+; The screen is a 320 x 192 FCM bitmap whose cells are numbered down the
+; columns (video.c): pixel (x, y) is at
+;     buffer + (x >> 3) * COLSTRIDE + y * 8 + (x & 7)
+; so a pixel column is a run of bytes 8 apart, and a pixel row is what the
+; DMA's line-drawing address calculator walks with "X column bytes" of
+; COLSTRIDE - 8. Every span on the screen is one DMA job:
+;
+;   - a road row: a copy from the road profile (a horizontal strip of the
+;     road, -1.5 .. 1.5 half-widths, mip-mapped) with a fractional source
+;     step, so the DMA scales it to the row's width; grass by DMA fill on
+;     either side
+;   - a sky row: a fill (the gradient) or copies from the panoramas, the
+;     near one with transparency
+;   - a sprite: one transparent, scaled copy per screen column (textures
+;     stored column by column) or per row (stored row by row)
+;
+; rd_frame projects the road and draws the ground and the sky; it leaves
+; each segment edge's projection in e_* for the sprites (game.c), which it
+; draws with rd_sprite, far to near.
+;
+; Projection (world units, z ahead, x right, y up; SEG = 256 units):
+;   edge i is at z = i * 256 - cam_zf (at least NEAR)
+;   scale s = FOCAL * 65536 / z            (pixels per unit, 16.16)
+;   screen x = 160 + x * s / 65536, y = HZ + (cam_y - y) * s / 65536,
+;   road half-width = RW * s / 65536       (all kept in 8.8 pixels)
+; The road bends by adding dx to x at each edge, and the curve of the
+; segment to dx (cam_dx0 makes the first, partly passed segment smooth).
+; A segment fills the rows between its two edges that nearer ground has not
+; filled (CLIP is the lowest row still free), with x and the half-width
+; stepped per row. Then the rows above CLIP are sky.
+;
+; Parameters travel in globals; the routines work in a base page of their
+; own (rd_page) and leave Z = 0 for the compiled code.
+
+#include "gen_config.h"
+
+.cpu _45gs02
+.segmentOrder code, data, bss
+
+.global _rd_frame
+.global _rd_sprite
+.global _rd_bank
+.global _rd_page
+.global _rd_rows
+.global _cam_zf
+.global _cam_x
+.global _cam_y
+.global _cam_dx0
+.global _pano_far_off
+.global _pano_near_off
+.global _win_curve
+.global _win_ylo
+.global _win_yhi
+.global _win_var
+.global _win_w
+.global _e_sxl
+.global _e_sxh
+.global _e_syl
+.global _e_syh
+.global _e_s0
+.global _e_s1
+.global _e_s2
+.global _e_clip
+.global _e_n
+.global _sp_id
+.global _sp_x
+.global _sp_y
+.global _sp_w
+.global _sp_h
+.global _sp_clip
+.global _rd_sprites
+.global _rd_fill_rows
+.global _fr_y0
+.global _pano_far_a
+.global _pano_near_a
+.global _fr_n
+.global _fr_col
+.global _win_sprl
+.global _win_sprr
+.global _win_oxl
+.global _win_oxr
+.global _vc_n
+.global _vc_pos_l
+.global _vc_pos_h
+.global _vc_id
+.global _vc_axle
+.global _vc_xl
+.global _vc_xh
+.global _vc_yl
+.global _vc_yh
+.global _rd_draw
+.global _rd_wet
+.global _scen_max
+.global _rd_rain
+.global _rn_n
+.global _rn_xl
+.global _rn_xh
+.global _rn_y
+.global _rn_len
+.global _spr_tw
+.global _spr_th
+.global _spr_ww
+.global _sky_col
+
+.extern _prof_a0
+.extern _prof_a1
+.extern _var_one
+.extern _prof_grass
+.extern _prof_grass_r
+.extern _spr_a0
+.extern _spr_a1
+.extern _spr_a2
+.extern _ceil_col
+.extern _face_col
+
+MULA  = $D770
+MULB  = $D774
+MULP  = $D778
+DIVQ  = $D768             ; quotient: 4 bytes of fraction, then 4 of integer
+MSTAT = $D70F             ; bit 7: the divider is busy
+
+ROWS  = SCR_H
+NWIN  = DRAW + 2
+
+; --- rd_page ---------------------------------------------------------------
+T0    = $00               ; 32-bit temporaries
+T1    = $04
+T2    = $08
+JX    = $10               ; a job: x (16 bits), y, mode, count, source, step
+JY    = $12
+JMODE = $13               ; 0 copy, 1 copy with transparency, 2 fill
+JN    = $14
+JSRC  = $16
+JSTEP = $1A
+I     = $20               ; edge
+CLIP  = $21               ; lowest free row (signed 16)
+ZZ    = $24
+XW    = $28               ; world x of the edge, relative to the camera
+DX    = $2C
+SS    = $30               ; scale
+SXN   = $34               ; near edge: x, y, half-width (8.8 pixels)
+SYN   = $38
+WN    = $3C
+SXF   = $40               ; far edge
+SYF   = $44
+WF    = $48
+DXDY  = $4C               ; per row up
+DWDY  = $50
+RX    = $54               ; the row's x and half-width
+RWD   = $58
+RY    = $5C               ; the row (signed 16)
+YTOP  = $5E               ; the segment's top row (signed 16)
+VAR   = $60               ; road variant * 8
+MIP   = $61
+KM    = $62               ; texels per pixel at this mip (8.8)
+LEFT  = $66
+X0    = $6A
+X1    = $6C
+GRASS = $6E
+GRASSR = $6F
+YN    = $70               ; floor of SYN, SYF (signed 16)
+YF    = $72
+DY    = $74
+TMP   = $78
+TMP2  = $79
+; rd_sprite
+XL    = $80               ; signed 16
+XR    = $82
+YT    = $84
+YB    = $86
+C0    = $88
+C1    = $8A
+R0    = $8C
+R1    = $8E
+SU    = $90               ; 32 bits (8.8 in the low 16)
+SV    = $94
+UU    = $98               ; 24 bits
+VV    = $9C
+TW    = $A0
+TH    = $A1
+ADR   = $A4               ; 32 bits
+CM    = $A8
+NLEFT = $AA               ; rows / columns left (16 bits)
+PREV  = $AC               ; the texture row / column of the last one
+PI    = $B0               ; place: edge, fraction, sprite, x offset, scale
+PF    = $B1
+PID   = $B2
+POX   = $B4
+PS    = $B8
+VC    = $BC               ; rd_sprites: next car, edge
+PE    = $BD
+POY   = $BE               ; place: height above the road (world units)
+; the tunnels
+SCN   = $C0               ; a tunnel's ceiling at the near edge, the far (8.8 rows)
+SCF   = $C4
+CT0   = $C8               ; the rows its ceiling covers (signed 16; CT1 < 0: none)
+CT1   = $CA
+NB    = $CC               ; the mouths found: how many, their edges, their kinds
+BE    = $CD               ;   (2 each; kind 1: into a tunnel, 0: out of one)
+BK    = $CF
+SCNL  = $D1               ; scenery at this edge and beyond is not drawn
+TT    = $D2
+FY    = $D4               ; faces: the row (16), the last, the mouth's top
+FYE   = $D6
+FYC   = $D8
+FXL   = $DA               ;   its sides (pixels)
+FXR   = $DC
+FCOL  = $DE
+FB    = $DF
+FK    = $E0
+FW    = $E4               ;   its half-width (8.8)
+RCX   = $E8
+FYG   = $EA               ;   the face's grass down to here, its lintel from here
+FYL   = $EC
+GCOL  = $EE
+LCOL  = $EF
+#define PAIRS 24          /* every other edge projected beyond this one, */
+#define QUADS 72          /*   every fourth beyond this */
+#if ((DRAW - QUADS) / 4) * 4 != DRAW - QUADS     /* (not & 3: cp45 #375) */
+#error "DRAW - QUADS must be a multiple of 4"
+#endif
+
+.data
+_rd_bank:       .byte 4         ; the bank of the buffer drawn into
+_rd_rows:       .byte SCR_H     ; rows of ground and sky to draw
+_cam_zf:        .word 0         ; camera z within its segment (0..SEG-1)
+_cam_x:         .word 0         ; camera x (signed, world units)
+_cam_y:         .word 0         ; camera height (signed, world units)
+_cam_dx0:       .dword 0        ; the first dx (signed)
+_pano_far_off:  .word 0         ; panorama scroll (0..PANO_W-1)
+_pano_near_off: .word 0
+_e_n:           .byte 0         ; edges projected
+_sp_id:         .byte 0
+_sp_x:          .word 0
+_sp_y:          .word 0
+_sp_w:          .word 0
+_sp_h:          .word 0
+_sp_clip:       .byte 0
+_vc_n:          .byte 0
+_rd_draw:       .byte DRAW      ; the last edge projected (less in fog)
+_scen_max:      .byte SCEN_FAR  ; scenery beyond this edge is not drawn
+_rd_wet:        .byte 0         ; the cars' reflections (bit 0), their spray (bit 1)
+_rn_n:          .byte 0         ; streaks of rain
+_pano_far_a:    .dword 0        ; the circuit's panoramas in attic RAM (page-aligned)
+_pano_near_a:   .dword 0
+_fr_y0:         .byte 0
+_fr_n:          .byte 0
+_fr_col:        .byte 0
+
+; a row: enhanced job, line-drawing addressing along x
+hjob:
+    .byte $0B             ; F018B list
+    .byte $80
+hj_smb:
+    .byte $00             ; source megabyte
+    .byte $81, $00
+    .byte $82
+hj_sfr:
+    .byte $00             ; source step
+    .byte $83
+hj_sin:
+    .byte $01
+    .byte $84, $00, $85, $01
+    .byte $87, <(COLSTRIDE - 8), $88, >(COLSTRIDE - 8)
+    .byte $89, $08, $8A, $00
+    .byte $8B, $00, $8C, $00, $8D, $00, $8E, $00
+    .byte $8F, $80        ; line mode, x major, slope 0
+hj_trn:
+    .byte $06             ; transparency off ($07: on)
+    .byte $86, $00        ; transparent colour 0
+    .byte $00
+hj_cmd:
+    .byte $00             ; copy / fill
+hj_cnt:
+    .word 0
+hj_src:
+    .word 0
+hj_sbk:
+    .byte 0
+hj_dst:
+    .word 0
+hj_dbk:
+    .byte 4
+    .byte 0
+    .word 0
+
+; a column: dest step 8, always transparent
+vjob:
+    .byte $0B
+    .byte $80
+vj_smb:
+    .byte $00
+    .byte $81, $00
+    .byte $82
+vj_sfr:
+    .byte $00
+    .byte $83
+vj_sin:
+    .byte $01
+    .byte $84, $00, $85, $08
+    .byte $8F, $00
+    .byte $07, $86, $00
+    .byte $00
+    .byte $00             ; copy
+vj_cnt:
+    .word 0
+vj_src:
+    .word 0
+vj_sbk:
+    .byte 0
+vj_dst:
+    .word 0
+vj_dbk:
+    .byte 4
+    .byte 0
+    .word 0
+
+; road width (whole pixels, 0..127) -> mip level; level -> 2^(24-m) >> 16
+mip_of:
+    .byte 7, 7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4
+    .byte 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+    .byte 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+    .byte 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+    .byte 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    .byte 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    .byte 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    .byte 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+mip_num:
+    .byte 0, 128, 64, 32, 16, 8, 4, 2
+
+; cell column -> high byte of its offset (COLSTRIDE = $600)
+colhi:
+    .byte 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90
+    .byte 96, 102, 108, 114, 120, 126, 132, 138, 144, 150, 156, 162, 168, 174, 180, 186
+    .byte 192, 198, 204, 210, 216, 222, 228, 234
+
+.bss
+#ifdef DEBUG_PLACE
+.global dbg_log
+.global dbg_i
+dbg_log:    .res 256
+dbg_i:      .res 1
+#endif
+
+; the arrays rewritten every frame live below the program, in the free RAM
+; at LOWRAM ($1600-$1FFF)
+LOWRAM = $1600
+_e_sxl     = LOWRAM               ; each edge: screen x, y (pixels, signed 16),
+_e_sxh     = _e_sxl + NWIN
+_e_syl     = _e_sxh + NWIN
+_e_syh     = _e_syl + NWIN
+_e_s0      = _e_syh + NWIN        ;   scale (16.16, 24 bits)
+_e_s1      = _e_s0 + NWIN
+_e_s2      = _e_s1 + NWIN
+_e_clip    = _e_s2 + NWIN         ;   the lowest row nearer ground left free (+1; 0: none)
+_win_curve = _e_clip + NWIN       ; the track around the camera (track.c copies it in)
+_win_ylo   = _win_curve + NWIN
+_win_yhi   = _win_ylo + NWIN
+_win_var   = _win_yhi + NWIN
+_win_w     = _win_var + NWIN      ; road width, 64 = RW
+_vc_pos_l  = _win_w + NWIN        ; the cars to draw: edge and fraction,
+_vc_pos_h  = _vc_pos_l + 8
+_vc_id     = _vc_pos_h + 8        ;   sprite (the body), its axle,
+_vc_axle   = _vc_id + 8
+_vc_xl     = _vc_axle + 8         ;   x (world units)
+_vc_xh     = _vc_xl + 8
+_vc_yl     = _vc_xh + 8           ;   height above the road (world units)
+_vc_yh     = _vc_yl + 8
+LOWRAM_END = _vc_yh + 8
+
+; more in the BASIC screen's RAM at $0800, unused while the game runs (what
+; is there is set up again every frame): this file's base page, the scenery
+; of the window, video.c's row buffers ($0B80-$0C1F)
+LOWSCR     = $0800
+_rd_page   = LOWSCR
+_win_sprl  = LOWSCR + $100        ; scenery (sprite + 1, 0: none) and its x / 32
+_win_sprr  = _win_sprl + NWIN
+_win_oxl   = _win_sprr + NWIN
+_win_oxr   = _win_oxl + NWIN
+_rn_xl     = LOWSCR + $420        ; the rain (after video.c's rows): x, y, length
+_rn_xh     = _rn_xl + NDROP
+_rn_y      = _rn_xh + NDROP
+_rn_len    = _rn_y + NDROP
+; and tables that never change, copied in from attic RAM (LOWTAB_ATTIC) at
+; the start (disk.c's load_art): each sprite's size and width in the world,
+; each row's sky colour
+_spr_tw    = LOWTAB
+_spr_th    = _spr_tw + NSPR
+_spr_ww    = _spr_th + NSPR
+_sky_col   = _spr_ww + 2 * NSPR
+#if LOWTAB < 0xC20 + 4 * NDROP
+#error "the low tables overlap the rain"
+#endif
+#if LOWTAB + LOWTAB_SIZE > 0x1000
+#error "the low tables don't fit below $1000"
+#endif
+#if 0x900 + 4 * (DRAW + 2) > 0xB80
+#error "the window's scenery doesn't fit below $0B80"
+#endif
+#if (DRAW + 2) * 13 + 64 > 2560
+#error "the arrays don't fit in $1600-$1FFF"
+#endif
+
+.code
+
+#if COLSTRIDE != 1536
+#error "render.s45 assumes COLSTRIDE == $600"
+#endif
+#if SEG != 256
+#error "render.s45 assumes SEG == 256"
+#endif
+
+; --------------------------------------------------------------------------
+; jobs
+
+; the destination of (JX, JY) into the job at dst (hj_dst / vj_dst)
+.macro DEST dst
+    lda JX+1
+    lsr
+    lda JX
+    ror
+    lsr
+    lsr
+    tax
+    lda JY
+    lsr
+    lsr
+    lsr
+    lsr
+    lsr
+    clc
+    adc colhi,x
+    sta dst+1
+    lda JY
+    asl
+    asl
+    asl
+    sta TMP
+    lda JX
+    and #7
+    ora TMP
+    sta dst
+.endmacro
+
+; the source JSRC (28 bits) into a job's source fields
+.macro SOURCE src, sbk, smb
+    lda JSRC
+    sta src
+    lda JSRC+1
+    sta src+1
+    lda JSRC+2
+    and #$0F
+    sta sbk
+    lda JSRC+2
+    lsr
+    lsr
+    lsr
+    lsr
+    sta TMP
+    lda JSRC+3
+    asl
+    asl
+    asl
+    asl
+    ora TMP
+    sta smb
+.endmacro
+
+; run the job at lbl; the CPU waits until it is done
+.macro RUN lbl
+#ifndef PROFILE_NODMA
+    lda #0
+    sta $D702
+    sta $D704
+    lda #>lbl
+    sta $D701
+    lda #<lbl
+    sta $D705
+#endif
+.endmacro
+
+; start the job at lbl again: its bank and megabyte were set by a RUN and
+; nothing has changed $D702 / $D704 since (the DMA moves the list address
+; on as it reads the list, so both bytes of that are set again)
+.macro RERUN lbl
+#ifndef PROFILE_NODMA
+    lda #>lbl
+    sta $D701
+    lda #<lbl
+    sta $D705
+#endif
+.endmacro
+
+; a row span: JX, JY, JN, JMODE (and JSRC, JSTEP for a copy, JSRC for a fill)
+proc hspan
+    DEST hj_dst
+    lda JN
+    sta hj_cnt
+    lda JN+1
+    sta hj_cnt+1
+    lda JMODE
+    cmp #2
+    bne @copy
+    lda #3
+    sta hj_cmd
+    lda #$06
+    sta hj_trn
+    lda JSRC
+    sta hj_src
+    RUN hjob
+    rts
+@copy:
+    ldx #$06
+    cmp #0
+    beq @opaque
+    ldx #$07
+@opaque:
+    stx hj_trn
+    lda #0
+    sta hj_cmd
+    SOURCE hj_src, hj_sbk, hj_smb
+    lda JSTEP
+    sta hj_sfr
+    lda JSTEP+1
+    sta hj_sin
+    RUN hjob
+    rts
+endproc
+
+; a column span (transparent copy): JX, JY, JN, JSRC, JSTEP
+proc vspan
+    DEST vj_dst
+    lda JN
+    sta vj_cnt
+    lda JN+1
+    sta vj_cnt+1
+    SOURCE vj_src, vj_sbk, vj_smb
+    lda JSTEP
+    sta vj_sfr
+    lda JSTEP+1
+    sta vj_sin
+    RUN vjob
+    rts
+endproc
+
+; fill the whole row JY with colour A
+proc fill_row
+    sta hj_src
+    lda JY
+    asl
+    asl
+    asl
+    sta hj_dst
+    lda JY
+    lsr
+    lsr
+    lsr
+    lsr
+    lsr
+    sta hj_dst+1
+    lda #<SCR_W
+    sta hj_cnt
+    lda #>SCR_W
+    sta hj_cnt+1
+    lda #3
+    sta hj_cmd
+    lda #$06
+    sta hj_trn
+    RUN hjob
+    rts
+endproc
+
+
+; --------------------------------------------------------------------------
+; arithmetic (T0, T1 in; T2 out)
+
+; T2 = (T0 * T1) >> 8: T0 signed, T1 unsigned (both under 2^31)
+proc smul8
+    lda T0+3
+    bmi @neg
+    ldq T0
+    stq MULA
+    ldq T1
+    stq MULB
+    ldq MULP+1
+    stq T2
+    rts
+@neg:
+    lda #0
+    tax
+    tay
+    taz
+    sec
+    sbcq T0
+    stq MULA
+    ldq T1
+    stq MULB
+    ldq MULP+1
+    stq T2
+    lda #0
+    tax
+    tay
+    taz
+    sec
+    sbcq T2
+    stq T2
+    rts
+endproc
+
+; T2 = T0 / T1 in 8.8 (T0 signed, T1 > 0)
+proc sdiv8
+    lda T0+3
+    php
+    bpl @pos
+    lda #0
+    tax
+    tay
+    taz
+    sec
+    sbcq T0
+    stq T0
+@pos:
+    ldq T0
+    stq MULA
+    ldq T1
+    stq MULB
+@wait:
+    bit MSTAT
+    bmi @wait
+    ldq DIVQ+3
+    stq T2
+    plp
+    bpl @done
+    lda #0
+    tax
+    tay
+    taz
+    sec
+    sbcq T2
+    stq T2
+@done:
+    rts
+endproc
+
+; --------------------------------------------------------------------------
+
+; a road row: RY, RX, RWD, VAR
+proc road_row
+#ifdef PROFILE_NOROWS
+    rts
+#endif
+    lda RY
+    sta JY
+    ; under a quarter of a pixel wide (or negative): grass
+    lda RWD+3
+    bmi @thin
+    ora RWD+2
+    ora RWD+1
+    bne @wide
+    lda RWD
+    cmp #64
+    bcs @wide
+@thin:
+    lda VAR
+    clc
+    adc #NMIP-1
+    tax
+    lda _prof_grass,x
+    jmp fill_row
+@wide:
+    ; the mip level from the width: under 2 texels per pixel, so level m
+    ; for widths 2^(7-m) .. 2^(8-m) - 1 pixels (the last for all narrower)
+    lda RWD+3
+    ora RWD+2
+    bne @m0
+    lda RWD+1
+    bmi @m0
+    tax
+    lda mip_of,x
+    bra @mset
+@m0:
+    lda #0
+@mset:
+    sta MIP
+    ; KM = 2^(24 - m) / RWD: texels per pixel at that level (8.8)
+    lda #0
+    sta MULA
+    sta MULA+1
+    sta MULA+2
+    sta MULA+3
+    ldx MIP
+    bne @mn
+    lda #1
+    sta MULA+3
+    bra @md
+@mn:
+    lda mip_num,x
+    sta MULA+2
+@md:
+    ldq RWD
+    stq MULB
+@wait:
+    bit MSTAT
+    bmi @wait
+    ldq DIVQ+4
+    stq KM
+    lda VAR
+    clc
+    adc MIP
+    tax
+    lda _prof_grass,x
+    sta GRASS
+    lda _prof_grass_r,x
+    sta GRASSR
+    lda KM+3
+    ora KM+2
+    beq @kok
+    lda GRASS             ; too small to see: grass
+    jmp fill_row
+@kok:
+    ; LEFT = RX - 1.5 RWD, T1 = RX + 1.5 RWD
+    ldq RWD
+    lsrq
+    clc
+    adcq RWD
+    stq T0
+    ldq RX
+    sec
+    sbcq T0
+    stq LEFT
+    ldq RX
+    clc
+    adcq T0
+    stq T1
+    ; X0 = clamp((LEFT + 127) >> 8), X1 = clamp((T1 + 127) >> 8)
+    ldx #LEFT
+    jsr pixclamp
+    sta X0
+    stx X0+1
+    ldx #T1
+    jsr pixclamp
+    sta X1
+    stx X1+1
+    ; grass under it all when the road doesn't reach both sides
+    lda X0
+    ora X0+1
+    bne @grass
+    lda X1+1
+    cmp #>SCR_W
+    bne @grass
+    lda X1
+    cmp #<SCR_W
+    beq @nograss
+@grass:
+    lda GRASS
+    cmp GRASSR
+    bne @sides
+    jsr fill_row
+    bra @nograss
+@sides:
+    ; the two sides differ (a driveway): each to the road's edge
+    lda X0
+    ora X0+1
+    beq @sright
+    lda #0
+    sta JX
+    sta JX+1
+    lda X0
+    sta JN
+    lda X0+1
+    sta JN+1
+    lda GRASS
+    sta JSRC
+    lda #2
+    sta JMODE
+    jsr hspan
+@sright:
+    lda X1+1
+    cmp #>SCR_W
+    bne @sr
+    lda X1
+    cmp #<SCR_W
+    beq @nograss
+@sr:
+    lda X1
+    sta JX
+    lda X1+1
+    sta JX+1
+    sec
+    lda #<SCR_W
+    sbc X1
+    sta JN
+    lda #>SCR_W
+    sbc X1+1
+    sta JN+1
+    lda GRASSR
+    sta JSRC
+    lda #2
+    sta JMODE
+    jsr hspan
+@nograss:
+    ; the road: X0 .. X1
+    sec
+    lda X1
+    sbc X0
+    sta JN
+    lda X1+1
+    sbc X0+1
+    sta JN+1
+    bmi @done
+    ora JN
+    beq @done
+    ; texel (8.8) at X0 = ((X0 << 8) + 128 - LEFT) * KM >> 8
+    lda #128
+    sta T0
+    lda X0
+    sta T0+1
+    lda X0+1
+    sta T0+2
+    lda #0
+    sta T0+3
+    ldq T0
+    sec
+    sbcq LEFT
+    stq MULA
+    ldq KM
+    stq MULB
+    ; source = the profile's texel 0 + (texel >> 8): product >> 16
+    lda VAR
+    clc
+    adc MIP
+    tax
+    lda _prof_a0,x
+    clc
+    adc MULP+2
+    sta JSRC
+    lda _prof_a1,x
+    adc MULP+3
+    sta JSRC+1
+    lda #PROF_A2          ; (the profiles are all in one bank)
+    adc MULP+4
+    sta JSRC+2
+    lda #0
+    adc #0
+    sta JSRC+3
+    lda X0
+    sta JX
+    lda X0+1
+    sta JX+1
+    lda KM
+    sta JSTEP
+    lda KM+1
+    sta JSTEP+1
+    lda #0
+    sta JMODE
+    jmp hspan
+@done:
+    rts
+endproc
+
+; A/X = clamp(((bp value at X) + 127) >> 8, 0, 320): a pixel boundary
+proc pixclamp
+    clc
+    lda $00,x
+    adc #127
+    lda $01,x
+    adc #0
+    sta TMP
+    lda $02,x
+    adc #0
+    sta TMP2
+    lda $03,x
+    adc #0
+    bmi @zero
+    bne @max
+    lda TMP2
+    cmp #>SCR_W
+    bcc @ok
+    bne @max
+    lda TMP
+    cmp #<SCR_W
+    bcs @max
+@ok:
+    lda TMP
+    ldx TMP2
+    rts
+@zero:
+    lda #0
+    tax
+    rts
+@max:
+    lda #<SCR_W
+    ldx #>SCR_W
+    rts
+endproc
+
+; --------------------------------------------------------------------------
+
+; the edge I: project it into SXF, SYF, WF and keep it for the sprites
+proc project
+    ; ZZ = I * 256 - cam_zf, at least NEAR
+    lda #0
+    sec
+    sbc _cam_zf
+    sta ZZ
+    lda I
+    sbc _cam_zf+1
+    sta ZZ+1
+    lda #0
+    sbc #0
+    sta ZZ+2
+    sta ZZ+3
+    bmi @near
+    lda ZZ+2
+    ora ZZ+1
+    bne @far
+    lda ZZ
+    cmp #NEAR
+    bcs @far
+@near:
+    lda #NEAR
+    sta ZZ
+    lda #0
+    sta ZZ+1
+    sta ZZ+2
+    sta ZZ+3
+@far:
+    ; SS = FOCAL * 65536 / ZZ
+    lda #0
+    sta MULA
+    sta MULA+1
+    lda #<FOCAL
+    sta MULA+2
+    lda #>FOCAL
+    sta MULA+3
+    ldq ZZ
+    stq MULB
+@wait:
+    bit MSTAT
+    bmi @wait
+    ldq DIVQ+4
+    stq SS
+    stq T1
+    ; SXF = 160.0 + XW * SS >> 8
+    ldq XW
+    stq T0
+    jsr smul8
+    lda T2+3              ; (XW is in quarter units): T2 >>= 2, signed
+    asl
+    rorq T2
+    lda T2+3
+    asl
+    rorq T2
+    lda #0                ; Q = 160 << 8
+    ldx #SCR_W / 2
+    ldy #0
+    ldz #0
+    clc
+    adcq T2
+    stq SXF
+    ; SYF = HZ.0 + (cam_y - y) * SS >> 8
+    ldx I
+    sec
+    lda _cam_y
+    sbc _win_ylo,x
+    sta T0
+    lda _cam_y+1
+    sbc _win_yhi,x
+    sta T0+1
+    and #$80
+    beq @dyp
+    lda #$FF
+@dyp:
+    sta T0+2
+    sta T0+3
+    jsr smul8
+    lda #0
+    ldx #HZ
+    ldy #0
+    ldz #0
+    clc
+    adcq T2
+    stq SYF
+    ; SCF = HZ.0 + (cam_y - y - TUN_H) * SS >> 8: a tunnel's ceiling
+    sec
+    lda T0
+    sbc #<TUN_H
+    sta T0
+    lda T0+1
+    sbc #>TUN_H
+    sta T0+1
+    lda T0+2
+    sbc #0
+    sta T0+2
+    lda T0+3
+    sbc #0
+    sta T0+3
+    jsr smul8
+    lda #0
+    ldx #HZ
+    ldy #0
+    ldz #0
+    clc
+    adcq T2
+    stq SCF
+    ; WF = RW * width / 64 * SS >> 8 (the divided road is wider)
+    ldx I
+    lda _win_w,x
+    sta MULB
+    lda #0
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    sta MULA+2
+    sta MULA+3
+    lda #<RW
+    sta MULA
+    lda #>RW
+    sta MULA+1
+    lda MULP
+    sta T0
+    lda MULP+1
+    sta T0+1
+    lda MULP+2
+    sta T0+2
+    lda #0
+    sta T0+3
+    ldx #6
+@w64:
+    lsr T0+2
+    ror T0+1
+    ror T0
+    dex
+    bne @w64
+    jsr smul8
+    ldq T2
+    stq WF
+    ; for the sprites: the pixel x and y, the scale, the clip
+    ldx I
+    lda SXF+1
+    sta _e_sxl,x
+    lda SXF+2
+    sta _e_sxh,x
+    lda SYF+1
+    sta _e_syl,x
+    lda SYF+2
+    sta _e_syh,x
+    lda SS
+    sta _e_s0,x
+    lda SS+1
+    sta _e_s1,x
+    lda SS+2
+    sta _e_s2,x
+    ldz #0
+    rts
+endproc
+
+; the skipped edge halfway between edges X and Y (Y - X: 2 or 4)
+proc between
+    stx T1
+    sty T1+1
+    tya
+    clc
+    adc T1
+    ror                   ; (the sum passes 255 beyond edge 128)
+    sta T1+2              ; the edge in between
+    clc
+    lda _e_sxl,x
+    adc _e_sxl,y
+    sta T0
+    lda _e_sxh,x
+    adc _e_sxh,y
+    cmp #$80
+    ror
+    sta T0+1
+    ror T0
+    clc
+    lda _e_syl,x
+    adc _e_syl,y
+    sta T0+2
+    lda _e_syh,x
+    adc _e_syh,y
+    cmp #$80
+    ror
+    sta T0+3
+    ror T0+2
+    clc
+    lda _e_s0,x
+    adc _e_s0,y
+    sta T2
+    lda _e_s1,x
+    adc _e_s1,y
+    sta T2+1
+    lda _e_s2,x
+    adc _e_s2,y
+    ror
+    sta T2+2
+    ror T2+1
+    ror T2
+    ldx T1+2
+    lda T0
+    sta _e_sxl,x
+    lda T0+1
+    sta _e_sxh,x
+    lda T0+2
+    sta _e_syl,x
+    lda T0+3
+    sta _e_syh,x
+    lda T2
+    sta _e_s0,x
+    lda T2+1
+    sta _e_s1,x
+    lda T2+2
+    sta _e_s2,x
+    rts
+endproc
+
+; Y16 at A/X = the floor of the 8.8 value at bp X (saturated to 16 bits)
+.macro FLOOR16 src, dst
+    lda src+3
+    bmi @neg\@
+    bne @big\@
+    lda src+2
+    bmi @big\@
+    sta dst+1
+    lda src+1
+    sta dst
+    bra @done\@
+@big\@:
+    lda #$FF
+    sta dst
+    lda #$7F
+    sta dst+1
+    bra @done\@
+@neg\@:
+    cmp #$FF
+    bne @small\@
+    lda src+2
+    bpl @small\@
+    sta dst+1
+    lda src+1
+    sta dst
+    bra @done\@
+@small\@:
+    lda #0
+    sta dst
+    lda #$80
+    sta dst+1
+@done\@:
+.endmacro
+
+; the rows of segment I - 1, between the near edge (SXN..) and the far (SXF..)
+proc segment
+    FLOOR16 SYN, YN
+    FLOOR16 SYF, YF
+    ; hidden behind nearer ground: YF >= CLIP
+    lda YF
+    cmp CLIP
+    lda YF+1
+    sbc CLIP+1
+    bvc @v1
+    eor #$80
+@v1:
+    bmi @visible
+    rts
+@visible:
+    ; bottom row: min(YN, CLIP); top row: max(YF + 1, 0)
+    lda YN
+    cmp CLIP
+    lda YN+1
+    sbc CLIP+1
+    bvc @v2
+    eor #$80
+@v2:
+    bmi @ynlow
+    lda CLIP
+    sta RY
+    lda CLIP+1
+    sta RY+1
+    bra @bot
+@ynlow:
+    lda YN
+    sta RY
+    lda YN+1
+    sta RY+1
+@bot:
+    clc
+    lda YF
+    adc #1
+    sta YTOP
+    lda YF+1
+    adc #0
+    sta YTOP+1
+    bpl @top
+    lda #0
+    sta YTOP
+    sta YTOP+1
+@top:
+    ; not up into a tunnel's ceiling (rows CT0..CT1, drawn already): from
+    ; under it (and the rows above are left free, not covered)
+    lda CT1+1
+    bmi @noband
+    lda CT1
+    cmp YTOP
+    lda CT1+1
+    sbc YTOP+1
+    bvc @vb
+    eor #$80
+@vb:
+    bmi @noband
+    lda CT1
+    sta YF
+    clc
+    adc #1
+    sta YTOP
+    lda CT1+1
+    sta YF+1
+    adc #0
+    sta YTOP+1
+@noband:
+    ; any rows? RY >= YTOP
+    lda RY
+    cmp YTOP
+    lda RY+1
+    sbc YTOP+1
+    bvc @v3
+    eor #$80
+@v3:
+    bpl @rows
+    jmp @clip
+@rows:
+    ldx I
+    lda _win_var-1,x
+    asl
+    asl
+    asl
+    sta VAR
+    ; one row (most of the far segments): halfway between the edges. Its
+    ; colour would be whichever stripe the row lands on this frame, light
+    ; or dark, flashing as the road moves: one row is always the light one
+    ; (var_one: the driveways keep their side, the water and the bank stay)
+    lda RY
+    cmp YTOP
+    bne @many
+    lda RY+1
+    cmp YTOP+1
+    bne @many
+    lda VAR
+    lsr
+    lsr
+    lsr
+    tax
+    lda _var_one,x
+    asl
+    asl
+    asl
+    sta VAR
+    ldq SXN
+    clc
+    adcq SXF
+    stq RX
+    lda RX+3
+    asl
+    rorq RX
+    ldq WN
+    clc
+    adcq WF
+    stq RWD
+    lsrq RWD
+    jsr road_row
+    jmp @clip
+@many:
+    ; T1 = SYN - SYF (> 0)
+    ldq SYN
+    sec
+    sbcq SYF
+    stq T1
+    ; DXDY = (SXF - SXN) / T1, DWDY = (WF - WN) / T1 (8.8)
+    ldq SXF
+    sec
+    sbcq SXN
+    stq T0
+    jsr sdiv8
+    ldq T2
+    stq DXDY
+    ldq WF
+    sec
+    sbcq WN
+    stq T0
+    jsr sdiv8
+    ldq T2
+    stq DWDY
+    ; o = SYN - (RY << 8) - 128; RX = SXN + DXDY * o >> 8, RWD likewise
+    lda #128
+    sta T0
+    lda RY
+    sta T0+1
+    lda RY+1
+    sta T0+2
+    lda #0
+    sta T0+3
+    ldq SYN
+    sec
+    sbcq T0
+    stq T1                ; o (>= -128: SYN >= RY.0)
+    lda T1+3
+    bpl @opos
+    lda #0                ; (tiny: no correction)
+    sta T1
+    sta T1+1
+    sta T1+2
+    sta T1+3
+@opos:
+    ldq DXDY
+    stq T0
+    jsr smul8
+    ldq SXN
+    clc
+    adcq T2
+    stq RX
+    ldq DWDY
+    stq T0
+    jsr smul8
+    ldq WN
+    clc
+    adcq T2
+    stq RWD
+@row:
+    jsr road_row
+    ldq RX
+    clc
+    adcq DXDY
+    stq RX
+    ldq RWD
+    clc
+    adcq DWDY
+    stq RWD
+    ; next row up, until YTOP
+    lda RY
+    cmp YTOP
+    bne @next
+    lda RY+1
+    cmp YTOP+1
+    beq @clip
+@next:
+    lda RY
+    bne @dec
+    dec RY+1
+@dec:
+    dec RY
+    bra @row
+@clip:
+    ; CLIP = min(CLIP, YF)
+    lda YF
+    cmp CLIP
+    lda YF+1
+    sbc CLIP+1
+    bvc @v4
+    eor #$80
+@v4:
+    bpl @done
+    lda YF
+    sta CLIP
+    lda YF+1
+    sta CLIP+1
+@done:
+    rts
+endproc
+
+; --------------------------------------------------------------------------
+; the tunnels: a ceiling over the road, the walls each side (the road
+; profile's beyond its walkways, and on the ceiling's rows), and their
+; mouths: seen from outside a face of rock round a dark hole, from inside
+; the walls round the light at the end
+
+; A = the mip level for the 8.8 width at bp X (as road_row's)
+proc mip_at
+    lda $03,x
+    bmi @m7
+    ora $02,x
+    bne @m0
+    lda $01,x
+    bmi @m0
+    tay
+    lda mip_of,y
+    rts
+@m0:
+    lda #0
+    rts
+@m7:
+    lda #NMIP-1
+    rts
+endproc
+
+; a ceiling row JY: RX, RWD (the road's half-width there), VAR. The walls
+; across the row (their upper part: ceil_col's second half), the ceiling
+; between them (TUN_U = 73/64 road widths)
+proc ceil_row
+    ldx #RWD
+    jsr mip_at
+    sta MIP
+    lda VAR
+    and #8
+    ora #16
+    clc
+    adc MIP
+    tax
+    lda _ceil_col,x
+    jsr fill_row
+    lda RWD+3
+    bmi @done
+    ldq RWD
+    lsrq
+    lsrq
+    lsrq
+    stq T0
+    lsrq
+    lsrq
+    lsrq
+    clc
+    adcq T0
+    clc
+    adcq RWD
+    stq T0
+    ldq RX
+    sec
+    sbcq T0
+    stq LEFT
+    ldq RX
+    clc
+    adcq T0
+    stq T1
+    ldx #LEFT
+    jsr pixclamp
+    sta X0
+    stx X0+1
+    ldx #T1
+    jsr pixclamp
+    sta X1
+    stx X1+1
+    sec
+    lda X1
+    sbc X0
+    sta JN
+    lda X1+1
+    sbc X0+1
+    sta JN+1
+    bmi @done
+    ora JN
+    beq @done
+    lda X0
+    sta JX
+    lda X0+1
+    sta JX+1
+    lda VAR               ; light or dark (the variant's bit 0, VAR's bit 3)
+    and #8
+    clc
+    adc MIP
+    tax
+    lda _ceil_col,x
+    sta JSRC
+    lda #2
+    sta JMODE
+    jmp hspan
+@done:
+    rts
+endproc
+
+; the ceiling of segment I - 1 (in a tunnel): its rows from the near
+; edge's (SCN) down to the far edge's (SCF), under those drawn already
+; (CT1) and above the ground (CLIP)
+proc ceiling
+    FLOOR16 SCN, YN
+    FLOOR16 SCF, YF
+    lda CT1+1
+    bmi @first
+    clc
+    lda CT1
+    adc #1
+    sta YTOP
+    lda CT1+1
+    adc #0
+    sta YTOP+1
+    bra @t
+@first:
+    lda YN
+    sta YTOP
+    lda YN+1
+    sta YTOP+1
+    bpl @t
+    lda #0
+    sta YTOP
+    sta YTOP+1
+@t:
+    ; the last row: min(YF, CLIP)
+    lda YF
+    cmp CLIP
+    lda YF+1
+    sbc CLIP+1
+    bvc @v1
+    eor #$80
+@v1:
+    bmi @yf
+    lda CLIP
+    sta RY
+    lda CLIP+1
+    sta RY+1
+    bra @b
+@yf:
+    lda YF
+    sta RY
+    lda YF+1
+    sta RY+1
+@b:
+    lda RY
+    cmp YTOP
+    lda RY+1
+    sbc YTOP+1
+    bvc @v2
+    eor #$80
+@v2:
+    bpl @rows
+    rts
+@rows:
+    lda CT1+1
+    bpl @ct0
+    lda YTOP
+    sta CT0
+    lda YTOP+1
+    sta CT0+1
+@ct0:
+    lda RY
+    sta CT1
+    lda RY+1
+    sta CT1+1
+    ldx I
+    lda _win_var-1,x
+    asl
+    asl
+    asl
+    sta VAR
+    ; T1 = SCF - SCN; none (or less): one row, the far edge's
+    ldq SCF
+    sec
+    sbcq SCN
+    stq T1
+    lda T1+3
+    bmi @flat
+    ora T1+2
+    ora T1+1
+    beq @flat
+    ; DXDY = (SXF - SXN) / T1, DWDY = (WF - WN) / T1 (per row down)
+    ldq SXF
+    sec
+    sbcq SXN
+    stq T0
+    jsr sdiv8
+    ldq T2
+    stq DXDY
+    ldq WF
+    sec
+    sbcq WN
+    stq T0
+    jsr sdiv8
+    ldq T2
+    stq DWDY
+    ; o = (YTOP << 8) + 128 - SCN (at least 0): RX = SXN + DXDY * o >> 8
+    lda #128
+    sta T1
+    lda YTOP
+    sta T1+1
+    lda YTOP+1
+    sta T1+2
+    lda #0
+    sta T1+3
+    ldq T1
+    sec
+    sbcq SCN
+    stq T1
+    lda T1+3
+    bpl @opos
+    lda #0
+    sta T1
+    sta T1+1
+    sta T1+2
+    sta T1+3
+@opos:
+    ldq DXDY
+    stq T0
+    jsr smul8
+    ldq SXN
+    clc
+    adcq T2
+    stq RX
+    ldq DWDY
+    stq T0
+    jsr smul8
+    ldq WN
+    clc
+    adcq T2
+    stq RWD
+    bra @row
+@flat:
+    ldq SXF
+    stq RX
+    ldq WF
+    stq RWD
+    lda #0
+    tax
+    tay
+    taz
+    stq DXDY
+    stq DWDY
+@row:
+    lda YTOP
+    sta JY
+    jsr ceil_row
+    lda YTOP
+    cmp RY
+    bne @next
+    lda YTOP+1
+    cmp RY+1
+    beq @done
+@next:
+    inc YTOP
+    bne @ni
+    inc YTOP+1
+@ni:
+    ldq RX
+    clc
+    adcq DXDY
+    stq RX
+    ldq RWD
+    clc
+    adcq DWDY
+    stq RWD
+    bra @row
+@done:
+    ldz #0
+    rts
+endproc
+
+; the tunnels' mouths rd_frame found (NB, BE, BK), far to near. Seen from
+; outside (kind 1): a face of rock up to PORTAL_H, the hole in it as wide
+; as the tunnel and TUN_H high; from inside (kind 0): the walls round the
+; light at the end (the ceiling is above it already). Rows below the
+; mouth's edge's clip are behind nearer ground.
+proc faces
+@next:
+    lda NB
+    bne @one
+    rts
+@one:
+    dec NB
+    ldx NB
+    lda BE,x
+    sta FB
+    lda BK,x
+    sta FK
+    ldx FB
+    lda _e_clip,x
+    beq @next
+    dec a
+    sta FYE
+    lda #0
+    sta FYE+1
+    lda _e_syh,x          ; the road there, if higher
+    bmi @next
+    bne @yeok
+    lda _e_syl,x
+    cmp FYE
+    bcs @yeok
+    sta FYE
+@yeok:
+    lda _e_s0,x
+    sta T1
+    lda _e_s1,x
+    sta T1+1
+    lda _e_s2,x
+    sta T1+2
+    lda #0
+    sta T1+3
+    ; the road's half-width (8.8): RW * width / 64 * S >> 8
+    lda _win_w,x
+    sta MULB
+    lda #0
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    sta MULA+2
+    sta MULA+3
+    lda #<RW
+    sta MULA
+    lda #>RW
+    sta MULA+1
+    lda MULP
+    sta T0
+    lda MULP+1
+    sta T0+1
+    lda MULP+2
+    sta T0+2
+    lda #0
+    sta T0+3
+    ldx #6
+@w64:
+    lsr T0+2
+    ror T0+1
+    ror T0
+    dex
+    bne @w64
+    jsr smul8
+    ; the colour at its distance: the rock, or the tunnel's walls
+    ldx #T2
+    jsr mip_at
+    sta MIP
+    ldx FK
+    beq @wallc
+    tax
+    lda _face_col,x
+    bra @colok
+@wallc:
+    ora #16               ; (the walls' upper part, round the light)
+    tax
+    lda _ceil_col,x
+@colok:
+    sta FCOL
+    ldx MIP               ; the grass on top, the dark lintel over the hole
+    lda _prof_grass,x
+    sta GCOL
+    txa
+    clc
+    adc #(V_TUNNEL + 1) * 8
+    tax
+    lda _prof_grass,x
+    sta LCOL
+    ; the mouth's half-width: * 73 / 64
+    ldq T2
+    lsrq
+    lsrq
+    lsrq
+    stq T0
+    lsrq
+    lsrq
+    lsrq
+    clc
+    adcq T0
+    clc
+    adcq T2
+    stq FW
+    ; FYC = HZ + (cam_y - y - TUN_H) * S >> 16: the mouth's top
+    ldx FB
+    sec
+    lda _cam_y
+    sbc _win_ylo,x
+    sta T0
+    lda _cam_y+1
+    sbc _win_yhi,x
+    sta T0+1
+    and #$80
+    beq @dyp
+    lda #$FF
+@dyp:
+    sta T0+2
+    sta T0+3
+    sec
+    lda T0
+    sbc #<TUN_H
+    sta T0
+    lda T0+1
+    sbc #>TUN_H
+    sta T0+1
+    lda T0+2
+    sbc #0
+    sta T0+2
+    lda T0+3
+    sbc #0
+    sta T0+3
+    jsr smul8
+    lda #0
+    ldx #HZ
+    ldy #0
+    ldz #0
+    clc
+    adcq T2
+    stq T2
+    FLOOR16 T2, FYC
+    ; FY: the face's top (PORTAL_H) from outside, the mouth's from inside
+    lda FK
+    beq @inside
+    sec
+    lda T0
+    sbc #<(PORTAL_H - TUN_H)
+    sta T0
+    lda T0+1
+    sbc #>(PORTAL_H - TUN_H)
+    sta T0+1
+    lda T0+2
+    sbc #0
+    sta T0+2
+    lda T0+3
+    sbc #0
+    sta T0+3
+    jsr smul8
+    lda #0
+    ldx #HZ
+    ldy #0
+    ldz #0
+    clc
+    adcq T2
+    stq T2
+    FLOOR16 T2, FY
+    ; the grass: the top eighth; the lintel: a sixteenth over the hole
+    sec
+    lda FYC
+    sbc FY
+    sta T0
+    lda FYC+1
+    sbc FY+1
+    sta T0+1
+    lsr T0+1
+    ror T0
+    lsr T0+1
+    ror T0
+    lsr T0+1
+    ror T0
+    clc
+    lda FY
+    adc T0
+    sta FYG
+    lda FY+1
+    adc T0+1
+    sta FYG+1
+    lsr T0+1
+    ror T0
+    sec
+    lda FYC
+    sbc T0
+    sta FYL
+    lda FYC+1
+    sbc T0+1
+    sta FYL+1
+    lda FYL
+    bne @fl
+    dec FYL+1
+@fl:
+    dec FYL
+    bra @fy
+@inside:
+    lda FYC
+    sta FY
+    lda FYC+1
+    sta FY+1
+@fy:
+    lda FY+1
+    bpl @fy0
+    lda #0
+    sta FY
+    sta FY+1
+@fy0:
+    ; its sides: x -/+ FW (pixels, on the screen)
+    ldx FB
+    lda #0
+    sta T0
+    lda _e_sxl,x
+    sta T0+1
+    lda _e_sxh,x
+    sta T0+2
+    and #$80
+    beq @sxp
+    lda #$FF
+@sxp:
+    sta T0+3
+    ldq T0
+    sec
+    sbcq FW
+    stq LEFT
+    ldq T0
+    clc
+    adcq FW
+    stq T1
+    ldx #LEFT
+    jsr pixclamp
+    sta FXL
+    stx FXL+1
+    ldx #T1
+    jsr pixclamp
+    sta FXR
+    stx FXR+1
+@row:
+    ; to FYE
+    lda FYE
+    cmp FY
+    lda FYE+1
+    sbc FY+1
+    bvc @vr
+    eor #$80
+@vr:
+    bpl @draw
+    jmp @next
+@draw:
+    lda FY
+    sta JY
+    ; above the mouth: the whole row
+    lda FY
+    cmp FYC
+    lda FY+1
+    sbc FYC+1
+    bvc @vc
+    eor #$80
+@vc:
+    bpl @sides
+    ; grass, rock or the lintel
+    lda FY
+    cmp FYG
+    lda FY+1
+    sbc FYG+1
+    bvc @vg
+    eor #$80
+@vg:
+    bpl @rock
+    lda GCOL
+    bra @fill
+@rock:
+    lda FY
+    cmp FYL
+    lda FY+1
+    sbc FYL+1
+    bvc @vl
+    eor #$80
+@vl:
+    bpl @lintel
+    lda FCOL
+    bra @fill
+@lintel:
+    lda LCOL
+@fill:
+    jsr fill_row
+    jmp @inc
+@sides:
+    lda FXL
+    ora FXL+1
+    beq @right
+    lda #0
+    sta JX
+    sta JX+1
+    lda FXL
+    sta JN
+    lda FXL+1
+    sta JN+1
+    lda FCOL
+    sta JSRC
+    lda #2
+    sta JMODE
+    jsr hspan
+@right:
+    sec
+    lda #<SCR_W
+    sbc FXR
+    sta JN
+    lda #>SCR_W
+    sbc FXR+1
+    sta JN+1
+    ora JN
+    beq @inc
+    lda FXR
+    sta JX
+    lda FXR+1
+    sta JX+1
+    lda FCOL
+    sta JSRC
+    lda #2
+    sta JMODE
+    jsr hspan
+@inc:
+    inc FY
+    bne @rowj
+    inc FY+1
+@rowj:
+    jmp @row
+endproc
+
+; --------------------------------------------------------------------------
+
+; a sky row JY: the gradient, the far panorama, the near one over it
+proc sky_row
+#ifdef PROFILE_NOROWS
+    rts
+#endif
+    lda JY
+    cmp #PANO_FAR_Y
+    bcc @fill
+    cmp #PANO_FAR_Y + PANO_FAR_H
+    bcs @haze
+    ; far panorama row: PANO_FAR_ADDR + (y - top) * PANO_W + offset
+    sec
+    sbc #PANO_FAR_Y
+    sta T0
+    lda #0
+    sta T0+1
+    asl T0                ; * 512
+    rol T0+1
+    lda _pano_far_a
+    sta T1
+    lda T0
+    clc
+    adc _pano_far_a+1
+    sta T1+1
+    lda T0+1
+    adc _pano_far_a+2
+    sta T1+2
+    lda _pano_far_a+3
+    sta T1+3
+    lda #0
+    sta JMODE
+    ldx _pano_far_off
+    ldy _pano_far_off+1
+    jsr pano_copy
+    ; the near panorama, transparent
+    lda JY
+    cmp #PANO_NEAR_Y
+    bcc @done
+    cmp #PANO_NEAR_Y + PANO_NEAR_H
+    bcs @done
+    sec
+    sbc #PANO_NEAR_Y
+    sta T0
+    lda #0
+    sta T0+1
+    asl T0
+    rol T0+1
+    lda _pano_near_a
+    sta T1
+    lda T0
+    clc
+    adc _pano_near_a+1
+    sta T1+1
+    lda T0+1
+    adc _pano_near_a+2
+    sta T1+2
+    lda _pano_near_a+3
+    sta T1+3
+    lda #1
+    sta JMODE
+    ldx _pano_near_off
+    ldy _pano_near_off+1
+    jmp pano_copy
+@done:
+    rts
+@fill:
+    tax
+    lda _sky_col,x
+    bra @f
+@haze:
+    lda _prof_grass+NMIP-1   ; below the panoramas: far, hazy grass
+@f:
+    jmp fill_row
+endproc
+
+; copy a panorama row (address in T1, offset Y/X) across the row JY, in
+; two parts where it wraps around; JMODE 0 or 1
+proc pano_copy
+    stx T0
+    sty T0+1
+    ; JSRC = T1 + offset
+    clc
+    lda T1
+    adc T0
+    sta JSRC
+    lda T1+1
+    adc T0+1
+    sta JSRC+1
+    lda T1+2
+    adc #0
+    sta JSRC+2
+    lda T1+3
+    sta JSRC+3
+    lda #0
+    sta JSTEP
+    lda #1
+    sta JSTEP+1
+    lda #0
+    sta JX
+    sta JX+1
+    ; n1 = PANO_W - offset (at most SCR_W)
+    sec
+    lda #<PANO_W
+    sbc T0
+    sta JN
+    lda #>PANO_W
+    sbc T0+1
+    sta JN+1
+    cmp #>SCR_W
+    bcc @split
+    bne @whole
+    lda JN
+    cmp #<SCR_W
+    bcc @split
+@whole:
+    lda #<SCR_W
+    sta JN
+    lda #>SCR_W
+    sta JN+1
+    jmp hspan
+@split:
+    lda JN
+    sta T2
+    lda JN+1
+    sta T2+1
+    lda JMODE
+    sta T2+2
+    jsr hspan
+    lda T2+2
+    sta JMODE
+    lda T2
+    sta JX
+    lda T2+1
+    sta JX+1
+    sec
+    lda #<SCR_W
+    sbc T2
+    sta JN
+    lda #>SCR_W
+    sbc T2+1
+    sta JN+1
+    lda T1
+    sta JSRC
+    lda T1+1
+    sta JSRC+1
+    lda T1+2
+    sta JSRC+2
+    lda T1+3
+    sta JSRC+3
+    jmp hspan
+endproc
+
+; --------------------------------------------------------------------------
+
+; void rd_frame(void): the ground and the sky into buffer rd_bank
+proc _rd_frame
+    tba
+    pha
+    lda #>_rd_page
+    tab
+
+    lda _rd_bank
+    sta hj_dbk
+    sta vj_dbk
+
+    ldx _rd_rows          ; the rows below are covered (the bonnet)
+    dex
+    stx CLIP
+    lda #0
+    sta CLIP+1
+    sta NB                ; no tunnel's mouth, no ceiling yet
+    lda #$FF
+    sta CT1
+    sta CT1+1
+    ; XW = -cam_x, DX = cam_dx0
+    sec
+    lda #0
+    sbc _cam_x
+    sta XW
+    lda #0
+    sbc _cam_x+1
+    sta XW+1
+    lda #0
+    sbc #0
+    sta XW+2
+    sta XW+3
+    lda _cam_x+1
+    bpl @xok
+    lda XW+1
+    bmi @xok
+    lda #0
+    sta XW+2
+    sta XW+3
+@xok:
+    aslq XW               ; quarter units, as the curves
+    aslq XW
+    ldq _cam_dx0
+    stq DX
+    lda #0
+    sta I
+@edge:
+    ; a tunnel's mouth at this edge: segments I - 1 and I differ (2 at most)
+    ldx I
+    beq @nomouth
+    lda NB
+    cmp #2
+    bcs @nomouth
+    lda _win_var-1,x
+    cmp #V_TUNNEL
+    lda #0
+    rol
+    sta TT
+    lda _win_var,x
+    cmp #V_TUNNEL
+    lda #0
+    rol
+    cmp TT
+    beq @nomouth
+    ldx NB
+    sta BK,x
+    lda I
+    sta BE,x
+    inc NB
+@nomouth:
+    ; beyond PAIRS only every other edge is projected, beyond QUADS every
+    ; fourth (a segment there is a row or none): the ones between are
+    ; filled in for the sprites
+    lda I
+    cmp #PAIRS + 1
+    bcc @proj
+    cmp #QUADS + 1
+    bcs @quad
+    and #1
+    beq @proj
+    bra @skip
+@quad:
+    and #3
+    beq @proj
+@skip:
+    ldx I
+    lda CLIP+1
+    bmi @full
+    lda CLIP
+    inc a
+    sta _e_clip,x
+    bra @advance
+@proj:
+    jsr project
+    lda I
+    beq @first
+    jsr segment
+    ldx I                 ; in a tunnel: its ceiling
+    lda _win_var-1,x
+    cmp #V_TUNNEL
+    bcc @noceil
+    jsr ceiling
+@noceil:
+    ; fill in the edges skipped since the last one projected
+    lda I
+    cmp #PAIRS + 1
+    bcc @first
+    ldy I
+    cmp #QUADS + 1
+    bcs @fill4
+    tya
+    tax
+    dex
+    dex
+    jsr between
+    bra @first
+@fill4:
+    tya
+    sec
+    sbc #4
+    tax
+    jsr between           ; I - 2 from I - 4 and I
+    lda I
+    sec
+    sbc #4
+    tax
+    tay
+    iny
+    iny
+    jsr between           ; I - 3
+    lda I
+    tay
+    tax
+    dex
+    dex
+    jsr between           ; I - 1
+@first:
+    ldx I
+    lda CLIP+1
+    bmi @full
+    lda CLIP
+    inc a
+    sta _e_clip,x
+    ; the far edge is the next near edge
+    ldq SXF
+    stq SXN
+    ldq SYF
+    stq SYN
+    ldq WF
+    stq WN
+    ldq SCF
+    stq SCN
+@advance:
+    ; XW += DX, DX += curve
+    ldq XW
+    clc
+    adcq DX
+    stq XW
+    ldx I
+    lda _win_curve,x
+    sta T0
+    lda #0
+    ldy T0
+    bpl @cpos
+    lda #$FF
+@cpos:
+    sta T0+1
+    sta T0+2
+    sta T0+3
+    ldq DX
+    clc
+    adcq T0
+    stq DX
+    inc I
+    lda _rd_draw          ; (I = rd_draw + 1: done)
+    cmp I
+    bcc @sky
+    jmp @edge
+@full:
+    ; the ground fills the screen: the edges beyond are hidden
+@hide:
+    lda #0
+    sta _e_clip,x
+    inx
+    cpx #DRAW + 1
+    bne @hide
+    lda I
+    sta _e_n
+    jmp @end
+@sky:
+    lda I
+    sta _e_n
+    ; rows 0 .. CLIP are sky
+    lda #0
+    sta JY
+@srow:
+    lda CLIP+1
+    bne @end
+    lda JY
+    cmp CLIP
+    beq @slast
+    bcs @end
+@slast:
+    lda CT1+1             ; (not a tunnel's ceiling's rows)
+    bmi @sdraw
+    lda JY
+    cmp CT0
+    bcc @sdraw
+    lda CT1
+    cmp JY
+    bcc @sdraw
+    bra @sskip
+@sdraw:
+    jsr sky_row
+@sskip:
+    inc JY
+    bra @srow
+@end:
+    ; the scenery drawn: to scen_max, and not beyond a tunnel's mouth
+    ldx _scen_max
+    inx
+    stx SCNL
+    lda NB
+    beq @scnl
+    lda BE
+    cmp SCNL
+    bcs @scnl
+    sta SCNL
+@scnl:
+    jsr faces
+    ldz #0
+    pla
+    tab
+    rts
+endproc
+
+; --------------------------------------------------------------------------
+
+; void rd_sprite(void): sprite sp_id, bottom centre (sp_x, sp_y), sp_w x sp_h
+; pixels, rows below sp_clip hidden
+proc _rd_sprite
+    tba
+    pha
+    lda #>_rd_page
+    tab
+    lda _rd_bank
+    sta hj_dbk
+    sta vj_dbk
+    jsr sprite
+    ldz #0
+    pla
+    tab
+    rts
+endproc
+
+; the sprite in sp_* (in rd_page; hj_dbk and vj_dbk set). Each screen row
+; (or column) is one job; from one to the next only the destination and
+; the source move, so only those are changed in the job.
+proc sprite
+    ; empty?
+    lda _sp_w
+    ora _sp_w+1
+    bne @w
+    rts
+@w:
+    lda _sp_h
+    ora _sp_h+1
+    bne @h
+    rts
+@h:
+    ; XL = x - w / 2, XR = XL + w, YT = y - h, YB = y
+    lda _sp_w+1
+    lsr
+    sta TMP2
+    lda _sp_w
+    ror
+    sta TMP
+    sec
+    lda _sp_x
+    sbc TMP
+    sta XL
+    lda _sp_x+1
+    sbc TMP2
+    sta XL+1
+    clc
+    lda XL
+    adc _sp_w
+    sta XR
+    lda XL+1
+    adc _sp_w+1
+    sta XR+1
+    sec
+    lda _sp_y
+    sbc _sp_h
+    sta YT
+    lda _sp_y+1
+    sbc _sp_h+1
+    sta YT+1
+    lda _sp_y
+    sta YB
+    lda _sp_y+1
+    sta YB+1
+    ; C0 = max(XL, 0), C1 = min(XR, 320)
+    lda XL
+    sta C0
+    lda XL+1
+    sta C0+1
+    bpl @c0
+    lda #0
+    sta C0
+    sta C0+1
+@c0:
+    lda XR
+    sta C1
+    lda XR+1
+    sta C1+1
+    bmi @none
+    cmp #>SCR_W
+    bcc @c1
+    bne @c1max
+    lda C1
+    cmp #<SCR_W
+    bcc @c1
+@c1max:
+    lda #<SCR_W
+    sta C1
+    lda #>SCR_W
+    sta C1+1
+@c1:
+    ; C0 < C1 ?
+    lda C0
+    cmp C1
+    lda C0+1
+    sbc C1+1
+    bvc @v1
+    eor #$80
+@v1:
+    bpl @none
+    ; R0 = max(YT, 0), R1 = min(YB, clip + 1)
+    lda YT
+    sta R0
+    lda YT+1
+    sta R0+1
+    bpl @r0
+    lda #0
+    sta R0
+    sta R0+1
+@r0:
+    lda _sp_clip
+    clc
+    adc #1
+    sta R1
+    lda #0
+    adc #0
+    sta R1+1
+    lda YB
+    cmp R1
+    lda YB+1
+    sbc R1+1
+    bvc @v2
+    eor #$80
+@v2:
+    bpl @r1
+    lda YB
+    sta R1
+    lda YB+1
+    sta R1+1
+@r1:
+    lda R0
+    cmp R1
+    lda R0+1
+    sbc R1+1
+    bvc @v3
+    eor #$80
+@v3:
+    bmi @some
+@none:
+    rts
+@some:
+    ; the texture
+    ldx _sp_id
+    lda _spr_tw,x
+    sta TW
+    lda _spr_th,x
+    sta TH
+    ; by columns when there are fewer columns than rows on the screen
+    lda #0
+    sta CM
+    sec
+    lda C1
+    sbc C0
+    sta TMP
+    lda C1+1
+    sbc C0+1
+    bne @byrows
+    sec
+    lda R1
+    sbc R0
+    cmp TMP
+    bcc @byrows
+    inc CM
+@byrows:
+    ; (X is the sprite: the addresses are in a table per byte; all in one
+    ; megabyte of attic RAM)
+    lda _spr_a0,x
+    sta ADR
+    lda _spr_a1,x
+    sta ADR+1
+    lda _spr_a2,x
+    sta ADR+2
+    lda #SPR_A3
+    sta ADR+3
+    lda CM
+    beq @addrok
+    ; by columns: that copy follows the one row by row, tw * th on
+    lda TW
+    sta MULA
+    lda TH
+    sta MULB
+    lda #0
+    sta MULA+1
+    sta MULA+2
+    sta MULA+3
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    clc
+    lda ADR
+    adc MULP
+    sta ADR
+    lda ADR+1
+    adc MULP+1
+    sta ADR+1
+    lda ADR+2
+    adc #0
+    sta ADR+2
+@addrok:
+    ; SU = tw / w, SV = th / h (8.8); give up when a step is 256 or more
+    lda TW
+    sta T0
+    lda #0
+    sta T0+1
+    sta T0+2
+    sta T0+3
+    lda _sp_w
+    sta T1
+    lda _sp_w+1
+    sta T1+1
+    lda #0
+    sta T1+2
+    sta T1+3
+    jsr sdiv8
+    lda T2+2
+    ora T2+3
+    bne @none
+    ldq T2
+    stq SU
+    lda TH
+    sta T0
+    lda #0
+    sta T0+1
+    lda _sp_h
+    sta T1
+    lda _sp_h+1
+    sta T1+1
+    jsr sdiv8
+    lda T2+2
+    ora T2+3
+    bne @none
+    ldq T2
+    stq SV
+    ; UU = (C0 - XL) * SU + SU / 2, VV = (R0 - YT) * SV + SV / 2
+    sec
+    lda C0
+    sbc XL
+    sta MULA
+    lda C0+1
+    sbc XL+1
+    sta MULA+1
+    lda #0
+    sta MULA+2
+    sta MULA+3
+    ldq SU
+    stq MULB
+    lda SU+1
+    lsr
+    sta TMP2
+    lda SU
+    ror
+    clc
+    adc MULP
+    sta UU
+    lda MULP+1
+    adc TMP2
+    sta UU+1
+    lda MULP+2
+    adc #0
+    sta UU+2
+    sec
+    lda R0
+    sbc YT
+    sta MULA
+    lda R0+1
+    sbc YT+1
+    sta MULA+1
+    ldq SV
+    stq MULB
+    lda SV+1
+    lsr
+    sta TMP2
+    lda SV
+    ror
+    clc
+    adc MULP
+    sta VV
+    lda MULP+1
+    adc TMP2
+    sta VV+1
+    lda MULP+2
+    adc #0
+    sta VV+2
+    lda CM
+    beq @rows
+    jmp @columns
+@rows:
+    ; by rows: each row from texture row VV >> 8, from texel UU >> 8 on
+    lda C0
+    sta JX
+    lda C0+1
+    sta JX+1
+    lda R0
+    sta JY
+    DEST hj_dst
+    sec
+    lda C1
+    sbc C0
+    sta hj_cnt
+    lda C1+1
+    sbc C0+1
+    sta hj_cnt+1
+    lda SU
+    sta hj_sfr
+    lda SU+1
+    sta hj_sin
+    lda #$07
+    sta hj_trn
+    lda #0
+    sta hj_cmd
+    sec
+    lda R1
+    sbc R0
+    sta NLEFT
+    ; JSRC = ADR + row * tw + (UU >> 8)
+    lda VV+1
+    sta MULA
+    lda #0
+    sta MULA+1
+    sta MULA+2
+    sta MULA+3
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    lda TW
+    sta MULB
+    clc
+    lda ADR
+    adc MULP
+    sta JSRC
+    lda ADR+1
+    adc MULP+1
+    sta JSRC+1
+    lda ADR+2
+    adc #0
+    sta JSRC+2
+    lda ADR+3
+    adc #0
+    sta JSRC+3
+    clc
+    lda JSRC
+    adc UU+1
+    sta JSRC
+    lda JSRC+1
+    adc #0
+    sta JSRC+1
+    bcc @r0ok
+    inc JSRC+2
+@r0ok:
+    lda VV+1
+    sta PREV
+    SOURCE hj_src, hj_sbk, hj_smb
+    RUN hjob
+    bra @rnext
+@rrow:
+    RERUN hjob
+@rnext:
+    dec NLEFT
+    beq @rdone
+    ; the next texture row: down by tw per row passed
+    clc
+    lda VV
+    adc SV
+    sta VV
+    lda VV+1
+    adc SV+1
+    sta VV+1
+    sec
+    sbc PREV
+    beq @rsame
+    tax
+    lda VV+1
+    sta PREV
+@radd:
+    clc
+    lda hj_src
+    adc TW
+    sta hj_src
+    bcc @rc
+    inc hj_src+1
+    bne @rc
+    inc hj_sbk            ; (a texture never crosses a megabyte)
+@rc:
+    dex
+    bne @radd
+@rsame:
+    ; one pixel row down: 8 bytes on
+    clc
+    lda hj_dst
+    adc #8
+    sta hj_dst
+    bcc @rrow
+    inc hj_dst+1
+    bra @rrow
+@rdone:
+    rts
+
+@columns:
+    ; by columns: each from texture column UU >> 8, from texel VV >> 8 down
+    lda C0
+    sta JX
+    lda C0+1
+    sta JX+1
+    lda R0
+    sta JY
+    DEST vj_dst
+    sec
+    lda R1
+    sbc R0
+    sta vj_cnt
+    lda #0
+    sta vj_cnt+1
+    lda SV
+    sta vj_sfr
+    lda SV+1
+    sta vj_sin
+    sec
+    lda C1
+    sbc C0
+    sta NLEFT
+    lda C1+1
+    sbc C0+1
+    sta NLEFT+1
+    ; JSRC = ADR + column * th + (VV >> 8)
+    lda UU+1
+    sta MULA
+    lda #0
+    sta MULA+1
+    sta MULA+2
+    sta MULA+3
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    lda TH
+    sta MULB
+    clc
+    lda ADR
+    adc MULP
+    sta JSRC
+    lda ADR+1
+    adc MULP+1
+    sta JSRC+1
+    lda ADR+2
+    adc #0
+    sta JSRC+2
+    lda ADR+3
+    adc #0
+    sta JSRC+3
+    clc
+    lda JSRC
+    adc VV+1
+    sta JSRC
+    lda JSRC+1
+    adc #0
+    sta JSRC+1
+    bcc @c0ok
+    inc JSRC+2
+@c0ok:
+    lda UU+1
+    sta PREV
+    SOURCE vj_src, vj_sbk, vj_smb
+    RUN vjob
+    bra @cnext0
+@col:
+    RERUN vjob
+@cnext0:
+    lda NLEFT
+    bne @cdec
+    dec NLEFT+1
+@cdec:
+    dec NLEFT
+    bne @cnext
+    lda NLEFT+1
+    beq @cdone
+@cnext:
+    ; the next texture column: th further per column passed
+    clc
+    lda UU
+    adc SU
+    sta UU
+    lda UU+1
+    adc SU+1
+    sta UU+1
+    sec
+    sbc PREV
+    beq @csame
+    tax
+    lda UU+1
+    sta PREV
+@cadd:
+    clc
+    lda vj_src
+    adc TH
+    sta vj_src
+    bcc @cc
+    inc vj_src+1
+    bne @cc
+    inc vj_sbk
+@cc:
+    dex
+    bne @cadd
+@csame:
+    ; one pixel right: the next byte, or the next cell column
+    inc vj_dst
+    lda vj_dst
+    and #7
+    bne @col
+    sec
+    lda vj_dst
+    sbc #8
+    sta vj_dst
+    clc
+    lda vj_dst+1
+    adc #6
+    sta vj_dst+1
+    jmp @col
+@cdone:
+    rts
+endproc
+
+; the sprite PID at edge PI + PF / 256, POX world units right of the
+; middle of the road: its size, place and clip from the edges' projection
+proc place
+    ldx PI
+    lda _e_clip,x
+    bne @vis
+    rts
+@vis:
+    dec a
+    sta _sp_clip
+    lda _e_s0,x
+    sta PS
+    lda _e_s1,x
+    sta PS+1
+    lda _e_s2,x
+    sta PS+2
+    lda #0
+    sta PS+3
+    lda _e_sxl,x
+    sta _sp_x
+    lda _e_sxh,x
+    sta _sp_x+1
+    lda _e_syl,x
+    sta _sp_y
+    lda _e_syh,x
+    sta _sp_y+1
+    lda PF
+    bne @frac
+    jmp @size
+@frac:
+    ; in between two edges: PS, sp_x, sp_y += (next - this) * PF / 256
+    sta T1
+    lda #0
+    sta T1+1
+    sta T1+2
+    sta T1+3
+    sec
+    lda _e_s0+1,x
+    sbc PS
+    sta T0
+    lda _e_s1+1,x
+    sbc PS+1
+    sta T0+1
+    lda _e_s2+1,x
+    sbc PS+2
+    sta T0+2
+    lda #0
+    sbc #0
+    sta T0+3
+    jsr smul8
+    ldq PS
+    clc
+    adcq T2
+    stq PS
+    ldx PI
+    sec
+    lda _e_sxl+1,x
+    sbc _sp_x
+    sta T0
+    lda _e_sxh+1,x
+    sbc _sp_x+1
+    sta T0+1
+    jsr sext16
+    jsr smul8
+    clc
+    lda _sp_x
+    adc T2
+    sta _sp_x
+    lda _sp_x+1
+    adc T2+1
+    sta _sp_x+1
+    ldx PI
+    sec
+    lda _e_syl+1,x
+    sbc _sp_y
+    sta T0
+    lda _e_syh+1,x
+    sbc _sp_y+1
+    sta T0+1
+    jsr sext16
+    jsr smul8
+    clc
+    lda _sp_y
+    adc T2
+    sta _sp_y
+    lda _sp_y+1
+    adc T2+1
+    sta _sp_y+1
+@size:
+    ; sp_w = ww * PS >> 16 (2 .. 1599, else not drawn)
+    lda PID
+    asl
+    tax
+    lda _spr_ww,x
+    sta MULA
+    lda _spr_ww+1,x
+    sta MULA+1
+    lda #0
+    sta MULA+2
+    sta MULA+3
+    ldq PS
+    stq MULB
+    lda MULP+4
+    bne @no
+    lda MULP+3
+    cmp #>1600
+    bcs @no
+    sta _sp_w+1
+    lda MULP+2
+    sta _sp_w
+    ora _sp_w+1
+    beq @no
+    lda _sp_w+1
+    bne @wok
+    lda _sp_w
+    cmp #2
+    bcc @no
+@wok:
+    ; sp_h = sp_w * th / tw (ldq above changed X)
+    ldx PID
+    lda _spr_th,x
+    sta MULB
+    lda #0
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+    sta MULA+2
+    sta MULA+3
+    lda _sp_w
+    sta MULA
+    lda _sp_w+1
+    sta MULA+1
+    ldq MULP
+    stq MULA
+    ldx PID
+    lda _spr_tw,x
+    sta MULB
+    lda #0
+    sta MULB+1
+    sta MULB+2
+    sta MULB+3
+@hdiv:
+    bit MSTAT
+    bmi @hdiv
+    lda DIVQ+4
+    sta _sp_h
+    lda DIVQ+5
+    sta _sp_h+1
+    ; sp_x += POX * PS >> 16
+    lda POX
+    sta T0
+    lda POX+1
+    sta T0+1
+    jsr sext16
+    ldq PS
+    stq T1
+    jsr smul8
+    clc
+    lda _sp_x
+    adc T2+1
+    sta _sp_x
+    lda _sp_x+1
+    adc T2+2
+    sta _sp_x+1
+    ; sp_y -= POY * PS >> 16: a car in the air
+    lda POY
+    ora POY+1
+    beq @ground
+    lda POY
+    sta T0
+    lda POY+1
+    sta T0+1
+    jsr sext16
+    jsr smul8             ; (T1 is still PS)
+    sec
+    lda _sp_y
+    sbc T2+1
+    sta _sp_y
+    lda _sp_y+1
+    sbc T2+2
+    sta _sp_y+1
+@ground:
+    lda PID
+    sta _sp_id
+#ifdef DEBUG_PLACE
+    ; (a log of the cars placed: edge, fraction, sprite, x, y, w, h)
+    lda PF
+    beq @nolog
+    ldx dbg_i
+    lda PI
+    sta dbg_log,x
+    lda PF
+    sta dbg_log+1,x
+    lda PID
+    sta dbg_log+2,x
+    lda _sp_x
+    sta dbg_log+3,x
+    lda _sp_x+1
+    sta dbg_log+4,x
+    lda _sp_y
+    sta dbg_log+5,x
+    lda _sp_y+1
+    sta dbg_log+6,x
+    lda _sp_w
+    sta dbg_log+7,x
+    txa
+    clc
+    adc #8
+    sta dbg_i
+@nolog:
+#endif
+    jmp sprite
+@no:
+    rts
+endproc
+
+; T0 (16 bits) sign-extended to 32
+proc sext16
+    lda #0
+    ldx T0+1
+    bpl @pos
+    lda #$FF
+@pos:
+    sta T0+2
+    sta T0+3
+    rts
+endproc
+
+; POX = (signed byte A) * 32
+proc ox32
+    sta POX
+    ldx #0
+    cmp #$80
+    bcc @pos
+    ldx #$FF
+@pos:
+    stx POX+1
+    asl POX
+    rol POX+1
+    asl POX
+    rol POX+1
+    asl POX
+    rol POX+1
+    asl POX
+    rol POX+1
+    asl POX
+    rol POX+1
+    rts
+endproc
+
+; void rd_sprites(void): the scenery of the window and the cars vc_*
+; (farthest first), far to near
+proc _rd_sprites
+    tba
+    pha
+    lda #>_rd_page
+    tab
+    lda _rd_bank
+    sta hj_dbk
+    sta vj_dbk
+    lda #0
+    sta VC
+    ldx _e_n
+    dex
+    stx PE
+    bne @edge
+    jmp @end
+@edge:
+    ; the cars beyond this edge
+    ldx VC
+    cpx _vc_n
+    bcs @scen
+    lda _vc_pos_h,x
+    cmp PE
+    bcc @scen
+    sta PI
+    lda _vc_pos_l,x
+    sta PF
+    lda _vc_axle,x        ; its axle (shadow, tyres) first, the body over it
+    sta PID
+    lda _vc_xl,x
+    sta POX
+    lda _vc_xh,x
+    sta POX+1
+    lda _rd_wet           ; (wet: its reflection on the road first, under it)
+    beq @dry
+    lda PID
+    pha
+    lda #<(0 - REFL_H)
+    sta POY
+    lda #>(0 - REFL_H)
+    sta POY+1
+    lda #SPR_REFL
+    sta PID
+    jsr place
+    pla
+    sta PID
+    ldx VC
+@dry:
+    lda _vc_yl,x
+    sta POY
+    lda _vc_yh,x
+    sta POY+1
+    jsr place
+    ldx VC
+    lda _vc_id,x
+    sta PID
+    jsr place
+    lda _rd_wet           ; (and its spray, over it)
+    and #2
+    beq @nospray
+    lda #SPR_SPRAY
+    sta PID
+    jsr place
+@nospray:
+    inc VC
+    jmp @edge
+@scen:
+    lda PE
+    cmp SCNL
+    bcs @next
+    ldx PE
+    lda _win_sprl,x
+    beq @right
+    dec a
+    sta PID
+    stx PI
+    lda #0
+    sta PF
+    lda _win_oxl,x
+    jsr ox32
+    lda #0
+    sta POY
+    sta POY+1
+    jsr place
+@right:
+    ldx PE
+    lda _win_sprr,x
+    beq @next
+    dec a
+    sta PID
+    stx PI
+    lda #0
+    sta PF
+    lda _win_oxr,x
+    jsr ox32
+    lda #0
+    sta POY
+    sta POY+1
+    jsr place
+@next:
+    dec PE
+    beq @end
+    jmp @edge
+@end:
+    ldz #0
+    pla
+    tab
+    rts
+endproc
+
+; void rd_fill_rows(void): fr_n rows from fr_y0 filled with fr_col, in
+; buffer rd_bank (the garage's walls and floor)
+proc _rd_fill_rows
+    tba
+    pha
+    lda #>_rd_page
+    tab
+    lda _rd_bank
+    sta hj_dbk
+    lda _fr_y0
+    sta JY
+@row:
+    lda _fr_n
+    beq @done
+    lda _fr_col
+    jsr fill_row
+    inc JY
+    dec _fr_n
+    bra @row
+@done:
+    ldz #0
+    pla
+    tab
+    rts
+endproc
+
+; void rd_rain(void): rn_n streaks of rain, each from (rn_xl/xh, rn_y) down,
+; rn_len long: a transparent copy of the rain sprite (one column) each
+proc _rd_rain
+    tba
+    pha
+    lda #>_rd_page
+    tab
+    lda _rd_bank
+    sta vj_dbk
+    ldx #SPR_RAIN
+    lda _spr_a0,x
+    sta JSRC
+    lda _spr_a1,x
+    sta JSRC+1
+    lda _spr_a2,x
+    sta JSRC+2
+    lda #SPR_A3
+    sta JSRC+3
+    SOURCE vj_src, vj_sbk, vj_smb
+    lda #0
+    sta vj_sfr
+    sta vj_cnt+1
+    lda #1
+    sta vj_sin
+    ldx #0
+@drop:
+    cpx _rn_n
+    bcs @done
+    stx RCX
+    lda _rn_xl,x
+    sta JX
+    lda _rn_xh,x
+    sta JX+1
+    lda _rn_y,x
+    sta JY
+    lda _rn_len,x
+    sta vj_cnt
+    DEST vj_dst
+    RUN vjob
+    ldx RCX
+    inx
+    bra @drop
+@done:
+    ldz #0
+    pla
+    tab
+    rts
+endproc
